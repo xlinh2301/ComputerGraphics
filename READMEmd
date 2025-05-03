@@ -19,17 +19,5 @@ ABC
     cd ComputerGraphics
     ```
 
-2.  **Cài đặt Dependencies:**
-    (Chỉ cần nếu bạn dùng `npm` hoặc `yarn` để quản lý `three` và các thư viện khác)
-    ```bash
-    npm install
-    ```
-    hoặc
-    ```bash
-    yarn install
-    ```
-
 ## Chạy dự án
-
-```bash
-npm run dev
+    down và chạy extensive "Live Server"
