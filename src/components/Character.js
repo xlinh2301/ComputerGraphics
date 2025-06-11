@@ -1,18 +1,22 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import * as CANNON from '../../node_modules/cannon-es/dist/cannon-es.js';
+import { createTrimesh } from '../utils/three-to-cannon.js';
+import { PhysicsSystem } from '../systems/PhysicsSystem.js';
 
 export class Character {
-    constructor(scene) {
+    constructor(scene, physicsSystem) {
         this.scene = scene;
+        this.physicsSystem = physicsSystem;
         this.character = null;
         this.mixer = null;
         this.animations = {};
         this.currentAnimation = null;
         
         // Physics properties
-        this.velocity = new THREE.Vector3(0, 0, 0);
+        this.body = null; // CANNON.Body
         this.onGround = false;
-        this.jumpForce = 15; // Increased jump force
+        this.jumpForce = 15;
         this.walkSpeed = 5;
         this.runSpeed = 10;
         this.crouchSpeed = 2;
@@ -30,6 +34,23 @@ export class Character {
         this.initialPosition = new THREE.Vector3(0, 0, 0);
     }
 
+    createBody() {
+        const shape = new CANNON.Box(new CANNON.Vec3(0.5, 0.9, 0.5));
+        
+        this.body = new CANNON.Body({
+            mass: 5,
+            position: new CANNON.Vec3().copy(this.character.position),
+            shape: shape,
+            material: this.physicsSystem.characterMaterial, // Use shared material
+            collisionFilterGroup: PhysicsSystem.CHARACTER_GROUP,
+            collisionFilterMask: PhysicsSystem.GROUND_GROUP
+        });
+        this.body.linearDamping = 0.9; // To prevent sliding
+        this.body.fixedRotation = true; // Prevent character from tipping over
+        this.body.allowSleep = false;
+        this.physicsSystem.addBody(this.body);
+    }
+
     async load() {
         const loader = new GLTFLoader();
         try {
@@ -45,6 +66,8 @@ export class Character {
             
             // Add to scene
             this.scene.add(this.character);
+
+            this.createBody(); // Create physics body after loading model
 
             // Setup animations
             if (gltf.animations && gltf.animations.length) {
@@ -95,7 +118,9 @@ export class Character {
 
         // If no movement input, stop the character completely
         if (direction.x === 0 && direction.z === 0) {
-            this.velocity.set(0, this.velocity.y, 0); // Keep only vertical velocity for gravity
+            // Stop horizontal movement
+            this.body.velocity.x = 0;
+            this.body.velocity.z = 0;
             return;
         }
 
@@ -125,12 +150,12 @@ export class Character {
         }
 
         // Calculate movement
-        const moveX = moveDirection.x * speed * deltaTime;
-        const moveZ = moveDirection.z * speed * deltaTime;
+        const moveX = moveDirection.x * speed;
+        const moveZ = moveDirection.z * speed;
 
         // Update velocity
-        this.velocity.x = moveX;
-        this.velocity.z = moveZ;
+        this.body.velocity.x = moveX;
+        this.body.velocity.z = moveZ;
 
         // Update position
         this.character.position.x += moveX;
@@ -139,7 +164,7 @@ export class Character {
         // Update rotation if moving
         if (moveDirection.lengthSq() > 0) {
             const angle = Math.atan2(moveDirection.x, moveDirection.z);
-            this.character.rotation.y = angle;
+            this.body.quaternion.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), angle);
             
             // Play appropriate animation
             if (this.isRunning) {
@@ -164,19 +189,15 @@ export class Character {
     }
 
     jump() {
+        this.checkIfOnGround();
         if (!this.onGround) {
             console.log('Cannot jump: Not on ground');
             return;
         }
         
         console.log('Jumping with force:', this.jumpForce);
-        this.velocity.y = this.jumpForce;
+        this.body.velocity.y = this.jumpForce;
         this.onGround = false;
-        
-        // Force update position to start the jump
-        if (this.character) {
-            this.character.position.y += 0.1; // Small offset to start the jump
-        }
         
         // Play jump animation
         this.playAnimation('jump', false);
@@ -212,37 +233,86 @@ export class Character {
         }
     }
 
-    update(deltaTime, environment) {
-        if (!this.character) return;
+    checkIfOnGround() {
+        const raycastStart = this.body.position;
+        // The character box half-height is 0.9. We cast a ray slightly longer than that.
+        const raycastEnd = new CANNON.Vec3(raycastStart.x, raycastStart.y - 0.91, raycastStart.z);
+        
+        const result = new CANNON.RaycastResult();
+        const world = this.physicsSystem.world;
+
+        const raycastOptions = {
+            collisionFilterGroup: PhysicsSystem.CHARACTER_GROUP,
+            collisionFilterMask: PhysicsSystem.GROUND_GROUP,
+            skipBackfaces: true
+        };
+
+        this.onGround = world.raycastClosest(raycastStart, raycastEnd, raycastOptions, result);
+
+        if (this.onGround) {
+            // Check if the surface is flat enough to be considered ground
+            // A normal pointing straight up has a dot product of 1 with the up vector.
+            // We allow for some slope, e.g., up to 45 degrees (cos(45) ~ 0.707)
+            const groundNormal = result.hitNormalWorld;
+            const upVector = new CANNON.Vec3(0, 1, 0);
+            const slopeAngle = groundNormal.dot(upVector);
+            
+            if (slopeAngle < 0.7) {
+                this.onGround = false;
+            }
+        }
+    }
+
+    update(deltaTime) {
+        if (!this.character || !this.body) return;
+
+        this.checkIfOnGround();
+
+        // --- Ground Adhesion ---
+        // If on ground, apply a small downward velocity to stick to the surface
+        if (this.onGround && this.body.velocity.y <= 0) {
+            this.body.velocity.y = -2;
+        }
+
+        // --- Keep character upright ---
+        // Get current orientation in Euler angles
+        const euler = new CANNON.Vec3();
+        this.body.quaternion.toEuler(euler);
+
+        // Create a new quaternion with only the rotation around the Y axis
+        const newQuaternion = new CANNON.Quaternion();
+        newQuaternion.setFromEuler(0, euler.y, 0);
+        this.body.quaternion.copy(newQuaternion);
+
+        // Also explicitly zero out angular velocity on x and z axes
+        this.body.angularVelocity.x = 0;
+        this.body.angularVelocity.z = 0;
+        // --- End keep upright ---
+
+        // Update character position and rotation from physics body
+        this.character.position.copy(this.body.position);
+        this.character.quaternion.copy(this.body.quaternion);
+        
+        // Fall reset
+        if (this.character.position.y < this.minHeight) {
+            this.resetPosition();
+        }
 
         // Update animations
         if (this.mixer) {
             this.mixer.update(deltaTime);
         }
-
-        // Update character position based on velocity
-        const oldPosition = this.character.position.clone();
-        this.character.position.add(this.velocity.clone().multiplyScalar(deltaTime));
-        
-        // Debug velocity
-        if (this.velocity.y !== 0) {
-            console.log('Current velocity:', this.velocity.y);
-        }
-        
-        // Check if character has fallen below threshold
-        if (this.character.position.y < this.minHeight) {
-            this.resetPosition();
-        }
     }
 
     resetPosition() {
-        if (!this.character) return;
+        if (!this.character || !this.body) return;
         
         // Reset position to initial position
-        this.character.position.copy(this.initialPosition);
+        this.body.position.copy(this.initialPosition);
         
         // Reset velocity
-        this.velocity.set(0, 0, 0);
+        this.body.velocity.set(0, 0, 0);
+        this.body.angularVelocity.set(0, 0, 0);
         
         // Reset ground state
         this.onGround = false;

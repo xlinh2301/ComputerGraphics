@@ -2,6 +2,7 @@
 // IMPORTS
 // ==========================================
 import * as THREE from 'three';
+import * as CANNON from '../node_modules/cannon-es/dist/cannon-es.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { Scene } from './core/Scene.js';
@@ -10,6 +11,7 @@ import { Environment } from './components/Environment.js';
 import { InputSystem } from './systems/InputSystem.js';
 import { CameraSystem } from './systems/CameraSystem.js';
 import { PhysicsSystem } from './systems/PhysicsSystem.js';
+import { createTrimesh } from './utils/three-to-cannon.js';
 
 // ==========================================
 // GAME CLASS
@@ -19,11 +21,11 @@ class Game {
         this.scene = new Scene();
         this.scene.setupLights();
         
-        this.character = new Character(this.scene.scene);
+        this.physicsSystem = new PhysicsSystem();
+        this.character = new Character(this.scene.scene, this.physicsSystem);
         this.environment = new Environment(this.scene.scene);
         this.inputSystem = new InputSystem();
         this.cameraSystem = new CameraSystem(this.scene.camera, this.scene.renderer);
-        this.physicsSystem = new PhysicsSystem();
         
         this.clock = new THREE.Clock();
         this.moveSpeed = 20;
@@ -39,15 +41,53 @@ class Game {
             await this.character.load();
             
             // Set character position to desired coordinates
-            const desiredPosition = new THREE.Vector3(-348.39, 0.94, 192.64);
-            this.character.character.position.copy(desiredPosition);
+            const desiredPosition = new THREE.Vector3(-348.39, 5, 192.64);
             this.character.setInitialPosition(desiredPosition);
-            console.log('Character position:', this.character.character.position);
+            this.character.body.position.copy(desiredPosition);
+            // console.log('Character position:', this.character.character.position);
             
             // Add environment objects as colliders
             this.environment.environment.traverse((object) => {
                 if (object.isMesh) {
-                    this.physicsSystem.addCollider(object);
+                    let shape;
+                    let shapeType = '';
+                    // For simple box-like objects, use a Box shape for better performance and stability
+                    if (object.name.startsWith('ground') || object.name.startsWith('Object')) {
+                        shapeType = 'Box';
+                        object.geometry.computeBoundingBox();
+                        const box = object.geometry.boundingBox;
+                        const size = new THREE.Vector3();
+                        box.getSize(size);
+
+                        // Apply the world scale of the object to the size of the box
+                        const worldScale = new THREE.Vector3();
+                        object.getWorldScale(worldScale);
+                        size.multiply(worldScale);
+
+                        shape = new CANNON.Box(new CANNON.Vec3(size.x / 2, size.y / 2, size.z / 2));
+                    } else {
+                        // For complex shapes, we need to apply scale to the vertices before creating the trimesh
+                        const clonedGeom = object.geometry.clone();
+                        const worldScale = new THREE.Vector3();
+                        object.getWorldScale(worldScale);
+                        clonedGeom.scale(worldScale.x, worldScale.y, worldScale.z);
+
+                        shape = createTrimesh(clonedGeom);
+                        shapeType = 'Trimesh';
+                    }
+
+                    console.log(`Creating physics body for: ${object.name}, Shape: ${shapeType}`);
+
+                    const body = new CANNON.Body({ 
+                        mass: 0, 
+                        shape: shape,
+                        material: this.physicsSystem.groundMaterial, // Use shared material
+                        collisionFilterGroup: PhysicsSystem.GROUND_GROUP,
+                        collisionFilterMask: PhysicsSystem.CHARACTER_GROUP
+                    });
+                    body.position.copy(object.getWorldPosition(new THREE.Vector3()));
+                    body.quaternion.copy(object.getWorldQuaternion(new THREE.Quaternion()));
+                    this.physicsSystem.addBody(body);
                 }
             });
             
@@ -80,8 +120,8 @@ class Game {
         
         document.getElementById('restartBtn').addEventListener('click', () => {
             const groundPosition = this.environment.getGroundPosition();
-            this.character.character.position.copy(groundPosition);
-            this.character.velocity.set(0, 0, 0);
+            this.character.body.position.copy(groundPosition);
+            this.character.body.velocity.set(0, 0, 0);
             this.character.onGround = false;
             
             this.cameraSystem.update(this.character.character, 0);
@@ -125,19 +165,17 @@ class Game {
         this.handleInput(deltaTime);
         
         // Update physics
-        if (this.character.character && this.environment.environment) {
-            this.physicsSystem.update(this.character, this.environment.environment, deltaTime);
-        }
+        this.physicsSystem.update(deltaTime);
         
-        this.character.update(deltaTime, this.environment.environment);
+        this.character.update(deltaTime);
         this.cameraSystem.update(this.character.character, deltaTime);
         
         // Log character position
-        console.log('Character position:', {
-            x: this.character.character.position.x.toFixed(2),
-            y: this.character.character.position.y.toFixed(2),
-            z: this.character.character.position.z.toFixed(2)
-        });
+        // console.log('Character position:', {
+        //     x: this.character.character.position.x.toFixed(2),
+        //     y: this.character.character.position.y.toFixed(2),
+        //     z: this.character.character.position.z.toFixed(2)
+        // });
         
         this.scene.renderer.render(this.scene.scene, this.scene.camera);
     }
