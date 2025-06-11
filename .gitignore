@@ -1,4 +1,4 @@
 # Dependencies
 /node_modules
-/public/models/character/*
-/public/models/environment/*
+package.json
+package-lock.json
